@@ -1,12 +1,14 @@
-import { Pool, DataTypeOIDs } from 'postgresql-client';
+import * as pg from 'pg';
 import RandomTextGenerator from 'random-text-generator';
 import benchmark from 'benchmark';
+//-----
+const { Pool } = pg.default;
 
-const clientsCount = 250;
-const connectionsMaxCount = 100;		// Max 150 - 3 (unless adapting servers postgresql.conf corresponding entry)
+const clientsCount = 150;
+const connectionsMaxCount = 30;		// Max 150 - 3 (unless adapting servers postgresql.conf corresponding entry)
 const resultsRowsMaxCount = 50;
-const quieryRange = 10000;
-const minSamplesCount = 10;
+const queryRange = 10000;
+const minSamplesCount = 5;
 
 // Feed DB
 //--------
@@ -14,19 +16,16 @@ let tablesData = [{
 	name: 'base',
 	struct: 'id serial PRIMARY KEY, value VARCHAR(50), created_on TIMESTAMP NOT NULL',
 	insert: '(id, value, created_on) VALUES($1, $2, now())',
-	insertStruct: [DataTypeOIDs.Int4, DataTypeOIDs.Varchar],
 	maxCount: 1000000
 }, {
 	name: 'base_sub1',
 	struct: 'id serial PRIMARY KEY, base_id serial, value VARCHAR(50), created_on TIMESTAMP NOT NULL',
 	insert: '(id, base_id, value, created_on) VALUES($1, $3, $2, now())',
-	insertStruct: [DataTypeOIDs.Int4, DataTypeOIDs.Varchar, DataTypeOIDs.Int4],
 	maxCount: 2000000
 }, {
 	name: 'base_sub2',
 	struct: 'id serial PRIMARY KEY, base_sub1_id serial, value VARCHAR(50), created_on TIMESTAMP NOT NULL',
 	insert: '(id, base_sub1_id, value, created_on) VALUES($1, $3, $2, now())',
-	insertStruct: [DataTypeOIDs.Int4, DataTypeOIDs.Varchar, DataTypeOIDs.Int4],
 	maxCount: 4000000
 }];
 //-----
@@ -38,19 +37,17 @@ if (feedDB) {
 	//-----
 	const MASTERpool = new Pool({
 		host: 'postgres://postgres@192.168.1.57:5432',
-		pool: {
-			min: 1,
-			max: 10,
-			idleTimeoutMillis: 5000
-		},
+		min: 1,
+		max: 10,
+		idleTimeoutMillis: 5000,
 		acquireMaxRetries: 2,
 		validation: true,
 		autoCommit: false
 	});
 	//=====
 	await Promise.all(tablesData.map(async (table, tableIdx, self) => {
-		let MASTERcon = await MASTERpool.acquire();
-		//=====
+		let MASTERcon = await MASTERpool.connect();
+		//============
 		await MASTERcon.query(`CREATE TABLE IF NOT EXISTS ${table.name} (${table.struct});`);
 		await MASTERcon.query(`DROP INDEX IF EXISTS ${table.name}_pkey;`);
 		//-----
@@ -74,8 +71,8 @@ if (feedDB) {
 		console.log(`${table.name}: [${curCount}/${table.maxCount}]`);
 		//-----
 		await MASTERcon.query(`CREATE UNIQUE INDEX ${table.name}_pkey ON ${table.name} USING btree (id);`);
-		//=====
-		await MASTERpool.release(MASTERcon);
+		//============
+		await MASTERcon.release();
 	}));
 	//-----
 	await MASTERpool.close();
@@ -83,21 +80,34 @@ if (feedDB) {
 
 // Query DB
 //---------
-const poolDefaults = {
-	min: 1,
-	max: connectionsMaxCount,
-	idleTimeoutMillis: 60000,
-	acquireMaxRetries: 2,
-	autoCommit: true
+const ErrFct = (err, client) => {
+	console.error('Unexpected error on idle client', err)
+	process.exit(-1);
 }
+const poolDefaults = {
+	user: 'postgres',
+	database: 'postgres',
+	password: 'postgres',
+	max: connectionsMaxCount
+}
+const PGpool = new Pool({
+	...poolDefaults,
+	host: '192.168.1.57',
+	port: 5443
+});
+PGpool.on('error', ErrFct);
 const MASTERpool = new Pool({
 	...poolDefaults,
-	host: 'postgres://postgres@192.168.1.57:5432'
+	host: '192.168.1.57',
+	port: 5433
 });
+MASTERpool.on('error', ErrFct);
 const monoPool = new Pool({
 	...poolDefaults,
-	host: 'postgres://postgres@192.168.1.57:5433'
+	host: '192.168.1.57',
+	port: 5433
 });
+monoPool.on('error', ErrFct);
 //=====
 const testQuery = `
 	SELECT base.id, base_sub1.id, base_sub2.id, base.value, base_sub1.value, base_sub2.value
@@ -105,22 +115,21 @@ const testQuery = `
 	JOIN base_sub1 ON base_sub1.base_id = base.id
 	JOIN base_sub2 ON base_sub2.base_sub1_id = base_sub1.id
 	WHERE base.id >= $1 AND base.id < $2
-	ORDER BY base.id ASC, base_sub1.id ASC, base_sub2.id ASC;
+	ORDER BY base.id ASC, base_sub1.id ASC, base_sub2.id ASC
+	LIMIT $3;
 `;
 async function DBtest(connectionPool, deferred) {
-	let clients = [...Array(clientsCount).keys()].map(key => ({ key: key, processed: false}));
+	let clients = [...Array(clientsCount).keys()].map(key => ({ key: key, processed: false }));
 	await Promise.all(clients.map(async client => {
-		let connection = await connectionPool.acquire();
-		const statement = await connection.prepare(testQuery, { paramTypes: [DataTypeOIDs.Int4, DataTypeOIDs.Int4] });
+		let connection = await connectionPool.connect();
 		//-----
-		let start = Math.floor(Math.random() * Math.max(0, tablesData[0].maxCount - quieryRange));
-		let end = start + quieryRange;
-		await statement.execute({ params: [start, end], fetchCount: resultsRowsMaxCount });
+		let start = Math.floor(Math.random() * Math.max(0, tablesData[0].maxCount - queryRange));
+		let end = start + queryRange;
+		let res = await connection.query(testQuery, [start, end, resultsRowsMaxCount]);
+		await connection.release();
 		//-----
 		client.processed = true;
-		process.stdout.write(`  Processed requests: ${clients.filter(client => client.processed).length}/${clientsCount}\r`);
-		//-----
-		await connectionPool.release(connection);
+		process.stdout.write(`  Processed requests: ${clients.filter(client => client.processed).length}/${clientsCount} (${res.rows.length} rows)\r`);
 	}));
 	//-----
 	deferred.resolve();
@@ -131,11 +140,13 @@ await new Promise((SUCCEED, FAILURE) => {
 	let benchOptions = {
 		defer: true,
 		minSamples: minSamplesCount,
-		onCycle: evt => console.log(String(evt.target))
+		onCycle: evt => console.log(String(evt.target)),
+		onError: err => console.log(err)
 	};
 	let benches = [
+		new benchmark('PGPool test', deferred => DBtest(PGpool, deferred), benchOptions),
 		new benchmark('Mono test', deferred => DBtest(monoPool, deferred), benchOptions),
-		new benchmark('Master test', deferred => DBtest(MASTERpool, deferred), benchOptions)
+		// new benchmark('Master test', deferred => DBtest(MASTERpool, deferred), benchOptions)
 	];
 	benches.forEach(bench => {
 		let event = benchmark.Event({ 'type': 'add', 'target': bench });
@@ -160,5 +171,7 @@ await new Promise((SUCCEED, FAILURE) => {
 	.run({ 'async': true })
 });
 //-----
-await monoPool.close();
-await MASTERpool.close();
+await monoPool.end();
+await MASTERpool.end();
+await PGpool.end();
+
